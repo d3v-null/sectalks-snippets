@@ -9,12 +9,13 @@ import inspect
 from tabulate import tabulate
 from pprint import pprint, pformat
 
-from scapy.all import *
-from scapy.utils import rdpcap
-from scapy.layers.l2 import Ether, Packet, Dot1Q
+# from scapy.all import *
+from scapy.utils import rdpcap, hexdump #, hexraw
+from scapy.packet import Raw, Packet
+from scapy.layers.l2 import Ether, Dot1Q, STP
 from scapy.layers.inet import TCP, UDP
 
-# PCAP_FILE = 'Gateway.pcap'
+PCAP_FILE = 'Gateway.pcap'
 # PCAP_FILE = 'httpd.pcap'
 PCAP_FILE = 'CCNP-SWITCH-final.pcap'
 PCAP_COUNT = 0
@@ -42,9 +43,9 @@ FIELD_STRINGS = SetStore()
 def report_counts(counts, name="COUNTS"):
     response = "%s: " % name.upper()
     if counts:
-        table = [(str(typ), qty) for typ, qty in counts.items()]
+        table = [(repr(typ), qty) for typ, qty in counts.items()]
         table = sorted(table, key=itemgetter(1), reverse=True)
-        response += "\n%s\n" % tabulate(table, headers=["TYPE", "QTY"])
+        response += "\n%s\n" % tabulate(table, headers=["VAL", "QTY"])
     else:
         response += 'NONE'
     return response + "\n"
@@ -60,14 +61,15 @@ def populate_scapy_field_info():
                         field_counts.update([field.name])
                         PACKET_FIELDS[obj].add(field.name)
                         FIELD_TYPES[field.name].add(obj)
-    pprint(sorted(PACKET_FIELDS.items()))
-    # pprint(sorted(FIELD_TYPES.items()))
     for field in ['type', 'proto']:
         if field in FIELD_TYPES:
             for pkt_class in FIELD_TYPES[field]:
                 FIELD_STRINGS[field].add((pkt_class, r"{%s:%%%s%%}" % (pkt_class.__name__, field)))
-    print report_counts(field_counts)
-    # pprint(FIELD_STRINGS)
+    with open('scapy_info.txt', 'w') as scapy_file:
+        scapy_file.write("PACKET FIELDS: %s\n\n" % pformat(sorted(PACKET_FIELDS.items())))
+        scapy_file.write("FIELD TYPES: %s\n\n" % pformat(sorted(FIELD_TYPES.items())))
+        # scapy_file.write("TYPE COUNTS: %s" % str(report_counts(field_counts)))
+        # pprint(FIELD_STRINGS)
 
 def get_packet_field(packet, field):
     # print "searching for field %s in packet %s" % (field, packet.summary())
@@ -112,16 +114,16 @@ def get_packet_layers(packet):
             layer_ptr = None
     return layers
 
-def flatten_result(result_components):
+def flatten_result(result_components, serializer=str):
     response_compoments = []
     for cls, results in result_components.items():
         response_component = ""
         str_results = set()
         for result in results:
-            if str(result[0]) == str(result[1]):
-                str_results.add(str(result[0]))
+            if serializer(result[0]) == serializer(result[1]):
+                str_results.add(serializer(result[0]))
             else:
-                str_results.add("%s/%s" % (result[0], result[1]))
+                str_results.add("%s/%s" % (serializer(result[0]), serializer(result[1])))
         response_component = "%s:%s" % (cls.__name__, " > ".join(list(str_results)))
         response_compoments.append(response_component)
     return " | ".join(response_compoments)
@@ -132,43 +134,70 @@ def analyse(packets):
         cap_info = []
         count_dict = CountStore()
         observed_layers = set()
+        bridgemac_observations = SetStore()
 
         for pkt in packets:
             pkt_info = OrderedDict()
             pkt_info['layers'] = list(set(get_packet_layers(pkt)))
             observed_layers.update(pkt_info['layers'])
+            pkt_info['timestamp'] = pkt.sprintf(r'%.time%')
             pkt_info['class_stack'] = " | ".join([layer.__name__ for layer in pkt_info['layers']])
             pkt_info['type'] = flatten_result(get_packet_field(pkt, 'type'))
             pkt_info['protocol'] = flatten_result(get_packet_field(pkt, 'proto'))
             # pkt_info['class proto'] = pkt_info['class_stack']
             # if pkt_info['protocol']:
-            #     pkt_info['class proto'] = "(%s) %s" % (pkt_info['protocol'], pkt_info['class_stack'])
+            #     pkt_info['class proto'] = "(%s) %s" % (
+            #         pkt_info['protocol'],
+            #         pkt_info['class_stack']
+            #     )
             # count_dict.increment('class proto', pkt_info['class proto'])
             pkt_info['dport'] = flatten_result(get_packet_field(pkt, 'dport'))
             pkt_info['bridgemac'] = flatten_result(get_packet_field(pkt, 'bridgemac'))
             pkt_info['bridgeid'] = flatten_result(get_packet_field(pkt, 'bridgeid'))
-            pkt_info['vlan'] = ", ".join(["%s:%s" % (cls.__name__, list(results)[0][1]) for cls, results in get_packet_field(pkt, 'vlan').items()])
+            pkt_info['vlan'] = ", ".join([
+                "%s:%s" % (cls.__name__, list(results)[0][1]) \
+                for cls, results in get_packet_field(pkt, 'vlan').items()
+            ])
             if pkt_info['vlan'] and pkt_info['bridgeid'] and pkt_info['bridgemac']:
-                pkt_info['vlan bridge'] = "%s -- %s @ %s" % (pkt_info['vlan'], pkt_info['bridgeid'], pkt_info['bridgemac'])
-            for key in ['class_stack', 'type', 'protocol', 'dport', 'bridgemac', 'bridgeid', 'vlan', 'vlan bridge']:
+                pkt_info['vlan bridge'] = "%s -- %s @ %s" % (
+                    pkt_info['vlan'],
+                    pkt_info['bridgeid'],
+                    pkt_info['bridgemac']
+                )
+            if pkt_info['bridgemac'] and pkt_info['timestamp']:
+                bridgemac_observations[pkt_info['bridgemac']].add(pkt_info['timestamp'])
+            pkt_info['portid'] = flatten_result(get_packet_field(pkt, 'portid'))
+            pkt_info['rootid'] = flatten_result(get_packet_field(pkt, 'rootid'))
+            pkt_info['rootmac'] = flatten_result(get_packet_field(pkt, 'rootmac'))
+            pkt_info['bpduflags'] = flatten_result(get_packet_field(pkt, 'bpduflags'), serializer=(lambda x: bin(int(x))))
+            pkt_info['bpdutype'] = flatten_result(get_packet_field(pkt, 'bpdutype'))
+            # pkt_info['hexraw'] = hexraw(pkt[UDP].load)
+            # if UDP in pkt:
+                # pkt_info['udp_payload'] = str(pkt[UDP].load)
+                # pkt_info['udp_chksum'] = pkt[UDP].chksum
+                # pkt_info['udp_len'] = pkt[UDP].len
+
+
+            for key in ['class_stack', 'type', 'protocol', 'dport',
+                        'bridgemac', 'bridgeid', 'vlan', 'vlan bridge',
+                        'hexraw', 'udp_chksum', 'udp_len', 'udp_payload',
+                        'portid', 'rootid', 'rootmac', 'bpduflags', 'bpdutype' ]:
                 if key in pkt_info:
                     count_dict.increment(key, pkt_info[key])
 
-            # if Dot1Q in pkt_info['layers']:
-            #     dot1q_layer = pkt[Dot1Q]
-            #     print "layer: %s, vlan: %s, id: %s, mysummary: %s, summary: %s" % (type(dot1q_layer), dot1q_layer.vlan, dot1q_layer.id, dot1q_layer.mysummary(), dot1q_layer.summary())
-            #     pkt_info['.1q'] = dot1q_layer.mysummary()
-            #     count_dict.increment('.1q', pkt_info['.1q'])
+        # for layer in sorted(observed_layers):
+        #     print "layer %50s, fields %s" % (layer, PACKET_FIELDS.get(layer, set()))
+        #
+        # for pkt_class, fields in PACKET_FIELDS.items():
+        #     if 'vlan' in fields:
+        #         print pkt_class, "has vlan"
 
-        for layer in sorted(observed_layers):
-            print "layer %50s, fields %s" % (layer, PACKET_FIELDS.get(layer, set()))
-
-        for pkt_class, fields in PACKET_FIELDS.items():
-            if 'vlan' in fields:
-                print pkt_class, "has vlan"
+        # for bridgemac, observations in bridgemac_observations.items():
+        #     print "bridgemac %20s observations: %s" % (bridgemac, pformat(observations))
+        #     print "min: %s, max: %s" % (min(observations), max(observations))
 
         for name, counts in count_dict.items():
-            print "name %50s, counts %s" % (name, counts)
+            # print "name %50s, counts %s" % (name, counts)
             analysis_file.write(report_counts(counts, name))
 
 def main():
