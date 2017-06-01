@@ -11,7 +11,7 @@ from pprint import pprint, pformat
 
 from scapy.all import *
 from scapy.utils import rdpcap
-from scapy.layers.l2 import Ether, Packet
+from scapy.layers.l2 import Ether, Packet, Dot1Q
 from scapy.layers.inet import TCP, UDP
 
 # PCAP_FILE = 'Gateway.pcap'
@@ -129,30 +129,46 @@ def flatten_result(result_components):
 def analyse(packets):
     with open('analysis.txt', 'w') as analysis_file:
 
+        cap_info = []
         count_dict = CountStore()
         observed_layers = set()
 
         for pkt in packets:
-            layers = get_packet_layers(pkt)
-            observed_layers.update(layers)
-            pkt_classes = " | ".join([layer.__name__ for layer in layers])
-            count_dict.increment('class_stack', pkt_classes)
-            pkt_type = flatten_result(get_packet_field(pkt, 'type'))
-            count_dict.increment('type', pkt_type)
-            pkt_proto = flatten_result(get_packet_field(pkt, 'proto'))
-            count_dict.increment('protocol', pkt_proto)
-            class_proto = pkt_classes
-            if pkt_proto:
-                class_proto = "(%s) %s" % (pkt_proto, class_proto)
-            count_dict.increment('class proto', class_proto)
-            dport = flatten_result(get_packet_field(pkt, 'dport'))
-            count_dict.increment('dport', dport)
+            pkt_info = OrderedDict()
+            pkt_info['layers'] = list(set(get_packet_layers(pkt)))
+            observed_layers.update(pkt_info['layers'])
+            pkt_info['class_stack'] = " | ".join([layer.__name__ for layer in pkt_info['layers']])
+            pkt_info['type'] = flatten_result(get_packet_field(pkt, 'type'))
+            pkt_info['protocol'] = flatten_result(get_packet_field(pkt, 'proto'))
+            # pkt_info['class proto'] = pkt_info['class_stack']
+            # if pkt_info['protocol']:
+            #     pkt_info['class proto'] = "(%s) %s" % (pkt_info['protocol'], pkt_info['class_stack'])
+            # count_dict.increment('class proto', pkt_info['class proto'])
+            pkt_info['dport'] = flatten_result(get_packet_field(pkt, 'dport'))
+            pkt_info['bridgemac'] = flatten_result(get_packet_field(pkt, 'bridgemac'))
+            pkt_info['bridgeid'] = flatten_result(get_packet_field(pkt, 'bridgeid'))
+            pkt_info['vlan'] = ", ".join(["%s:%s" % (cls.__name__, list(results)[0][1]) for cls, results in get_packet_field(pkt, 'vlan').items()])
+            if pkt_info['vlan'] and pkt_info['bridgeid'] and pkt_info['bridgemac']:
+                pkt_info['vlan bridge'] = "%s -- %s @ %s" % (pkt_info['vlan'], pkt_info['bridgeid'], pkt_info['bridgemac'])
+            for key in ['class_stack', 'type', 'protocol', 'dport', 'bridgemac', 'bridgeid', 'vlan', 'vlan bridge']:
+                if key in pkt_info:
+                    count_dict.increment(key, pkt_info[key])
+
+            # if Dot1Q in pkt_info['layers']:
+            #     dot1q_layer = pkt[Dot1Q]
+            #     print "layer: %s, vlan: %s, id: %s, mysummary: %s, summary: %s" % (type(dot1q_layer), dot1q_layer.vlan, dot1q_layer.id, dot1q_layer.mysummary(), dot1q_layer.summary())
+            #     pkt_info['.1q'] = dot1q_layer.mysummary()
+            #     count_dict.increment('.1q', pkt_info['.1q'])
 
         for layer in sorted(observed_layers):
-            print layer, PACKET_FIELDS.get(layer, set())
+            print "layer %50s, fields %s" % (layer, PACKET_FIELDS.get(layer, set()))
+
+        for pkt_class, fields in PACKET_FIELDS.items():
+            if 'vlan' in fields:
+                print pkt_class, "has vlan"
 
         for name, counts in count_dict.items():
-            print "name %s, counts %s" % (name, counts)
+            print "name %50s, counts %s" % (name, counts)
             analysis_file.write(report_counts(counts, name))
 
 def main():
