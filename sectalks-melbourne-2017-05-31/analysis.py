@@ -7,7 +7,7 @@ import sys
 import inspect
 
 from tabulate import tabulate
-from pprint import pprint
+from pprint import pprint, pformat
 
 from scapy.all import *
 from scapy.utils import rdpcap
@@ -18,7 +18,7 @@ from scapy.layers.inet import TCP, UDP
 # PCAP_FILE = 'httpd.pcap'
 PCAP_FILE = 'CCNP-SWITCH-final.pcap'
 PCAP_COUNT = 0
-# PCAP_COUNT = 1000
+# PCAP_COUNT = 100
 
 class CountStore(OrderedDict):
     def __getitem__(self, key):
@@ -37,7 +37,7 @@ class SetStore(OrderedDict):
 
 FIELD_TYPES = SetStore()
 PACKET_FIELDS = SetStore()
-FIELD_STRINGS = OrderedDict()
+FIELD_STRINGS = SetStore()
 
 def report_counts(counts, name="COUNTS"):
     response = "%s: " % name.upper()
@@ -49,7 +49,7 @@ def report_counts(counts, name="COUNTS"):
         response += 'NONE'
     return response + "\n"
 
-def scapy_field_info():
+def populate_scapy_field_info():
     field_counts = Counter()
     for module in sys.modules:
         if re.match('scapy.layers', module):
@@ -60,88 +60,103 @@ def scapy_field_info():
                         field_counts.update([field.name])
                         PACKET_FIELDS[obj].add(field.name)
                         FIELD_TYPES[field.name].add(obj)
-    # pprint(sorted(PACKET_FIELDS.items()))
+    pprint(sorted(PACKET_FIELDS.items()))
     # pprint(sorted(FIELD_TYPES.items()))
     for field in ['type', 'proto']:
         if field in FIELD_TYPES:
-            FIELD_STRINGS[field] = ""
             for pkt_class in FIELD_TYPES[field]:
-                FIELD_STRINGS[field] += r"{%s:%%%s%%}" % (pkt_class.__name__, field)
+                FIELD_STRINGS[field].add((pkt_class, r"{%s:%%%s%%}" % (pkt_class.__name__, field)))
     print report_counts(field_counts)
-    pprint(FIELD_STRINGS)
+    # pprint(FIELD_STRINGS)
 
+def get_packet_field(packet, field):
+    # print "searching for field %s in packet %s" % (field, packet.summary())
+    results = SetStore()
+    layer_ptr = packet
+    while layer_ptr:
+        if hasattr(type(layer_ptr), 'fields_desc'):
+            fields = [field_desc.name for field_desc in type(layer_ptr).fields_desc]
+            # print "fields are %s" % fields
+            if field in fields:
+                get_result = getattr(layer_ptr, field)
+                sprintf_result = layer_ptr.sprintf(r"%%%s%%" % field)
+                results[type(layer_ptr)].add((get_result, sprintf_result))
+        layer_ptr = layer_ptr.payload if hasattr(layer_ptr, 'payload') else None
+    return results
 
+    # if field in FIELD_STRINGS:
+    #     for pkt_class, field_string in FIELD_STRINGS[field]:
+    #         if pkt_class not in packet:
+    #             layers = get_packet_layers(packet)
+    #             print "class %s not in packet with layers: %s" % (pkt_class, layers)
+    #             continue
+    #         sprintf_result = packet.sprintf(field_string)
+    #         print "sprintf_result", repr(sprintf_result)
+    #         get_result = None
+    #         if pkt_class in packet and hasattr(packet[pkt_class], field):
+    #             get_result = getattr(packet[pkt_class], field)
+    #         print "get_result", repr(get_result)
+    #         results[pkt_class.__name__] = (sprintf_result, get_result)
+    # print "returning results: \n", pformat(results)
+    # return results
 
+def get_packet_layers(packet):
+    layers = []
+    layer_ptr = packet
+    while layer_ptr:
+        layers.append(type(layer_ptr))
+        # layers.append(str(type(layer_ptr)))
+        try:
+            layer_ptr = layer_ptr.payload
+        except AttributeError:
+            layer_ptr = None
+    return layers
 
-
-# exit()
-
+def flatten_result(result_components):
+    response_compoments = []
+    for cls, results in result_components.items():
+        response_component = ""
+        str_results = set()
+        for result in results:
+            if str(result[0]) == str(result[1]):
+                str_results.add(str(result[0]))
+            else:
+                str_results.add("%s/%s" % (result[0], result[1]))
+        response_component = "%s:%s" % (cls.__name__, " > ".join(list(str_results)))
+        response_compoments.append(response_component)
+    return " | ".join(response_compoments)
 
 def analyse(packets):
     with open('analysis.txt', 'w') as analysis_file:
-        # list protos
-
-        # count_dict = OrderedDict([
-        #     ('class', Counter()),
-        #     ('proto', Counter()),
-        #     ('port', Counter()),
-        #     ('ethertype', Counter()),
-        #     ('class proto', Counter()),
-        # ])
 
         count_dict = CountStore()
+        observed_layers = set()
 
         for pkt in packets:
-            layers = []
-            layer_ptr = pkt
-            while layer_ptr:
-                layers.append(str(type(layer_ptr).__name__))
-                # layers.append(str(type(layer_ptr)))
-                try:
-                    layer_ptr = layer_ptr.payload
-                except AttributeError:
-                    layer_ptr = None
-            pkt_class = " | ".join(layers)
-            count_dict.increment('class', pkt_class)
-            ethertype = pkt.sprintf('{Ether:%Ether.type%}')
-            count_dict.increment('ethertype', ethertype)
-            proto = pkt.sprintf(FIELD_STRINGS['proto'])
-            count_dict.increment('proto', proto)
-            class_proto = pkt_class
-            if proto:
-                class_proto = "(%s) %s" % (proto, class_proto)
+            layers = get_packet_layers(pkt)
+            observed_layers.update(layers)
+            pkt_classes = " | ".join([layer.__name__ for layer in layers])
+            count_dict.increment('class_stack', pkt_classes)
+            pkt_type = flatten_result(get_packet_field(pkt, 'type'))
+            count_dict.increment('type', pkt_type)
+            pkt_proto = flatten_result(get_packet_field(pkt, 'proto'))
+            count_dict.increment('protocol', pkt_proto)
+            class_proto = pkt_classes
+            if pkt_proto:
+                class_proto = "(%s) %s" % (pkt_proto, class_proto)
             count_dict.increment('class proto', class_proto)
-            port_components = []
-            if TCP in pkt:
-                port_compoment = pkt.sprintf("%TCP.dport%")
-                if not re.match(r"\d+", port_compoment):
-                    port_compoment = "%s (%d)" % (port_compoment, pkt[TCP].dport)
-                port_components.append("TCP: %s" % port_compoment)
-            if UDP in pkt:
-                port_compoment = pkt.sprintf("%UDP.dport%")
-                if not re.match(r"\d+", port_compoment):
-                    port_compoment = "%s (%d)" % (port_compoment, pkt[UDP].dport)
-                port_components.append("UDP: %s" % port_compoment)
-            port = " | ".join(port_components)
-            count_dict.increment('port', port)
+            dport = flatten_result(get_packet_field(pkt, 'dport'))
+            count_dict.increment('dport', dport)
 
-
-
-        print "summary:"
-
-            # if Ether in pkt:
-            #
-            #     port = pkt.sprintf(r"{TCP:TCP:%TCP.dport%}{UDP:UDP:%UDP.dport%}{ICMP:ICMP:%ICMP.type%}")
-            #     if not port:
-            #         port = pkt.summary()
-            #     count_dict['port'].update([port])
+        for layer in sorted(observed_layers):
+            print layer, PACKET_FIELDS.get(layer, set())
 
         for name, counts in count_dict.items():
             print "name %s, counts %s" % (name, counts)
             analysis_file.write(report_counts(counts, name))
 
 def main():
-    scapy_field_info()
+    populate_scapy_field_info()
     rdpcap_args = [PCAP_FILE]
     if PCAP_COUNT:
         rdpcap_args += [PCAP_COUNT]
